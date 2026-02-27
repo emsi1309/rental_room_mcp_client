@@ -1,20 +1,51 @@
 /**
  * Main AI Agent Implementation
- * Orchestrates LLM and tool execution
+ * Orchestrates LLM and tool execution using native function calling
  */
 
-import { callOllama, parseToolCalls } from './ollama-client.js';
-import { executeMcpTool, createToolContext } from './tool-executor.js';
+import { callOllamaWithTools } from './ollama-client.js';
+import { executeMcpTool, getAvailableTools } from './tool-executor.js';
+import { filterRelevantTools } from './tool-filter.js';
 import { systemPrompt } from '../utils/prompt.js';
+import sessionManager from './session-manager.js';
 import logger from '../utils/logger.js';
 import config from '../config.js';
-import sessionManager from './session-manager.js';
 
-export class HostelAIAgent {
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if text contains non-English characters (e.g. Vietnamese)
+ */
+function isNonEnglish(text) {
+  return /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(text);
+}
+
+/**
+ * Detect if a message is purely conversational (greeting, small talk)
+ */
+function isConversationalMessage(text) {
+  const conversational = [
+    'xin chào', 'chào bạn', 'hello', 'hi ', 'hey',
+    'bạn là ai', 'who are you', 'bạn tên gì',
+    'cảm ơn', 'thank', 'thanks',
+    'tạm biệt', 'goodbye', 'bye',
+  ];
+  const lower = text.toLowerCase().trim();
+  // Only treat as conversational if short AND matches a pattern
+  return lower.length < 40 && conversational.some(kw => lower.includes(kw));
+}
+
+// ---------------------------------------------------------------------------
+// Agent Class
+// ---------------------------------------------------------------------------
+
+class HostelAIAgent {
   constructor() {
     this.systemPrompt = systemPrompt;
     this.conversationHistory = [];
-    this.maxToolCalls = config.maxToolCalls;
+    this.maxToolCalls = config.maxToolCalls || 5;
   }
 
   /**
@@ -28,45 +59,79 @@ export class HostelAIAgent {
     logger.info(`Processing message: ${userMessage}`);
 
     try {
-      // Get current session context
       const sessionContext = sessionManager.getSessionContext(sessionId);
+      const isVietnamese = isNonEnglish(userMessage);
 
-      // Add user message to history
-      this.conversationHistory.push({
-        role: 'user',
-        content: userMessage,
-        userId: userId || sessionContext.userId,
-        sessionId: sessionId || 'default',
-        timestamp: new Date(),
+      // -----------------------------------------------------------------------
+      // Stage 1: Detect conversational message (no tools needed)
+      // -----------------------------------------------------------------------
+      if (isConversationalMessage(userMessage)) {
+        logger.info('Conversational message detected - skipping tool calling');
+        const resp = await callOllamaWithTools(
+          [{ role: 'system', content: 'You are a friendly hostel management assistant. Respond in the same language as the user.' },
+           { role: 'user', content: userMessage }],
+          [], { temperature: 0.5 }
+        );
+        const text = resp.message.content || 'Xin chào! Tôi là trợ lý quản lý nhà trọ.';
+        this._addHistory('user', userMessage, sessionId);
+        this._addHistory('assistant', text, sessionId);
+        return this._buildResponse(true, text, [], [], userId, sessionId, sessionContext);
+      }
+
+      // -----------------------------------------------------------------------
+      // Stage 2: Load & filter tools
+      // -----------------------------------------------------------------------
+      const allTools = await getAvailableTools();
+      logger.info(`Loaded ${allTools.length} tools from MCP server`);
+
+      const availableTools = filterRelevantTools(allTools, userMessage, 15);
+      logger.info(`Using ${availableTools.length} relevant tools for this query`);
+
+      // -----------------------------------------------------------------------
+      // Stage 3: Call LLM with tools - KEEP IT SIMPLE
+      // Send the user message directly, no translation, no complex wrapping
+      // -----------------------------------------------------------------------
+      const messages = [
+        { role: 'system', content: this.systemPrompt },
+        // Include last few history items for context
+        ...this.conversationHistory.slice(-6).map(msg => ({
+          role: msg.role,
+          content: msg.content,
+        })),
+        { role: 'user', content: userMessage },
+      ];
+
+      logger.debug('Calling LLM with function calling...');
+      const llmResponse = await callOllamaWithTools(messages, availableTools, {
+        temperature: 0,
       });
 
-      // Build prompt with context
-      const toolContext = await createToolContext();
-      const conversationContext = this.buildConversationContext();
+      let { message, toolCalls } = llmResponse;
+      logger.info(`LLM returned ${toolCalls.length} tool call(s)`);
 
-      const fullPrompt = `${this.systemPrompt}
+      // -----------------------------------------------------------------------
+      // Stage 4: If no tool calls on first attempt, retry with stronger prompt
+      // -----------------------------------------------------------------------
+      if (toolCalls.length === 0 && availableTools.length > 0) {
+        logger.info('No tool calls on first attempt, retrying with explicit instruction...');
+        const toolList = availableTools.map(t => t.name).join(', ');
+        const retryMessages = [
+          { role: 'system', content: `You MUST call one of these tools: [${toolList}]. Do NOT respond with text. Call the tool now.` },
+          { role: 'user', content: userMessage },
+        ];
+        const retryResponse = await callOllamaWithTools(retryMessages, availableTools, { temperature: 0 });
+        if (retryResponse.toolCalls.length > 0) {
+          message = retryResponse.message;
+          toolCalls = retryResponse.toolCalls;
+          logger.info(`Retry succeeded: ${toolCalls.length} tool call(s)`);
+        } else {
+          logger.warn('Retry also failed to produce tool calls');
+        }
+      }
 
-${toolContext}
-
-${conversationContext}
-
-User: ${userMessage}
-
-Please analyze the user's request and respond. If you need to call tools, format them as:
-[TOOL_CALL]: tool_name({"param1": "value1", "param2": "value2"}) [/TOOL_CALL]
-
-You can call multiple tools if needed. After calling tools, provide your final response.`;
-
-      // Call LLM
-      logger.debug('Calling LLM...');
-      const llmResponse = await callOllama(fullPrompt);
-      logger.debug(`LLM Response: ${llmResponse.substring(0, 200)}...`);
-
-      // Parse tool calls from response
-      const toolCalls = parseToolCalls(llmResponse);
-      logger.info(`Found ${toolCalls.length} tool calls in LLM response`);
-
-      // Execute tools
+      // -----------------------------------------------------------------------
+      // Stage 5: Execute tools
+      // -----------------------------------------------------------------------
       const toolResults = [];
       let toolCallsExecuted = 0;
 
@@ -77,111 +142,98 @@ You can call multiple tools if needed. After calling tools, provide your final r
         }
 
         try {
-          logger.info(`Executing tool: ${toolCall.name}`);
-          // Pass session context when executing tools
-          const result = await executeMcpTool(toolCall.name, toolCall.args, sessionContext);
+          const toolName = toolCall.function.name;
+          const toolArgs = typeof toolCall.function.arguments === 'string'
+            ? JSON.parse(toolCall.function.arguments || '{}')
+            : toolCall.function.arguments || {};
+
+          logger.info(`Executing tool: ${toolName}(${JSON.stringify(toolArgs)})`);
+
+          const result = await executeMcpTool(toolName, toolArgs, sessionContext);
+
           toolResults.push({
-            name: toolCall.name,
-            args: toolCall.args,
+            id: toolCall.id || `call_${toolCallsExecuted}`,
+            name: toolName,
+            args: toolArgs,
             result,
           });
           toolCallsExecuted++;
         } catch (error) {
-          logger.error(`Tool execution failed: ${toolCall.name}`, error);
+          logger.error(`Tool execution failed: ${toolCall.function?.name}`, error);
           toolResults.push({
-            name: toolCall.name,
+            id: toolCall.id || `call_${toolCallsExecuted}`,
+            name: toolCall.function?.name || 'unknown',
             error: error.message,
           });
+          toolCallsExecuted++;
         }
       }
 
-      // Generate final response based on tool results
-      let finalResponse = llmResponse;
+      // -----------------------------------------------------------------------
+      // Stage 6: Build final response
+      // -----------------------------------------------------------------------
+      let finalResponseText;
 
       if (toolResults.length > 0) {
-        // Call LLM again to generate final response with tool results
-        const finalPrompt = `${this.systemPrompt}
-
-Based on the user's request and the tool execution results, provide a helpful response.
-
-User request: ${userMessage}
-
-Tool results:
-${JSON.stringify(toolResults, null, 2)}
-
-Please provide a clear, concise response to the user in their language (Vietnamese preferred if applicable).`;
-
-        finalResponse = await callOllama(finalPrompt);
+        // Summarize tool results
+        logger.debug('Getting final formatted response...');
+        const summaryMessages = [
+          { role: 'system', content: isVietnamese
+            ? 'Tóm tắt kết quả dưới đây bằng tiếng Việt, ngắn gọn và rõ ràng.'
+            : 'Summarize the following results clearly and concisely.' },
+          { role: 'user', content: `User asked: "${userMessage}"\n\nTool results:\n${JSON.stringify(toolResults.map(r => ({ tool: r.name, result: r.result })), null, 2)}` },
+        ];
+        const finalResp = await callOllamaWithTools(summaryMessages, [], { temperature: 0.3 });
+        finalResponseText = finalResp.message.content || 'Đã xử lý xong.';
+      } else {
+        finalResponseText = message.content || (isVietnamese
+          ? 'Xin lỗi, tôi không thể xử lý yêu cầu này.'
+          : 'Sorry, I could not process this request.');
       }
 
-      // Add assistant response to history
-      this.conversationHistory.push({
-        role: 'assistant',
-        content: finalResponse,
-        toolsCalled: toolCalls.map((t) => t.name),
-        sessionId: sessionId || 'default',
-        timestamp: new Date(),
-      });
+      // -----------------------------------------------------------------------
+      // Stage 7: Update conversation history
+      // -----------------------------------------------------------------------
+      this._addHistory('user', userMessage, sessionId, userId || sessionContext.userId);
+      this._addHistory('assistant', finalResponseText, sessionId, null, toolResults.map(t => t.name));
 
-      return {
-        success: true,
-        response: finalResponse,
-        toolsCalled: toolCalls.map((t) => t.name),
-        toolResults: toolResults,
-        userId: userId || sessionContext.userId,
-        sessionId: sessionId || 'default',
-        isAuthenticated: sessionContext.isAuthenticated,
-        timestamp: new Date(),
-      };
+      return this._buildResponse(true, finalResponseText, toolResults.map(t => t.name), toolResults, userId || sessionContext.userId, sessionId, sessionContext);
+
     } catch (error) {
-      logger.error('Error processing message', error);
-      return {
-        success: false,
-        error: error.message,
-        response: 'Xin lỗi, tôi gặp lỗi khi xử lý yêu cầu của bạn. Vui lòng thử lại sau.',
-        userId: userId,
-        sessionId: sessionId || 'default',
-        timestamp: new Date(),
-      };
+      logger.error('Agent processMessage error', error);
+      return this._buildResponse(false, `Error: ${error.message}`, [], [], userId, sessionId);
     }
   }
 
-  /**
-   * Build conversation context for the LLM
-   * @private
-   * @returns {string} Formatted conversation history
-   */
-  buildConversationContext() {
-    if (this.conversationHistory.length === 0) {
-      return '';
-    }
-
-    // Keep last 10 messages for context
-    const recentHistory = this.conversationHistory.slice(-10);
-    let context = 'Conversation History:\n';
-
-    recentHistory.forEach((msg) => {
-      const role = msg.role === 'user' ? 'User' : 'Assistant';
-      context += `${role}: ${msg.content}\n`;
+  _addHistory(role, content, sessionId, userId = null, toolsCalled = []) {
+    this.conversationHistory.push({
+      role, content,
+      ...(userId && { userId }),
+      ...(toolsCalled.length > 0 && { toolsCalled }),
+      sessionId: sessionId || 'default',
+      timestamp: new Date(),
     });
-
-    return context;
   }
 
-  /**
-   * Clear conversation history
-   */
-  clearHistory() {
-    this.conversationHistory = [];
-    logger.info('Conversation history cleared');
+  _buildResponse(success, response, toolsCalled, toolResults, userId, sessionId, sessionContext = {}) {
+    return {
+      success,
+      response,
+      toolsCalled,
+      toolResults,
+      userId,
+      sessionId: sessionId || 'default',
+      isAuthenticated: sessionContext.isAuthenticated || false,
+      timestamp: new Date(),
+    };
   }
 
-  /**
-   * Get conversation history
-   * @returns {Array} Current conversation history
-   */
   getHistory() {
     return this.conversationHistory;
+  }
+
+  clearHistory() {
+    this.conversationHistory = [];
   }
 }
 

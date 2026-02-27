@@ -5,7 +5,7 @@ dotenv.config();
 const config = {
   // Ollama Configuration
   ollamaApiUrl: process.env.OLLAMA_API_URL || 'http://localhost:11434/api',
-  ollamaModel: process.env.OLLAMA_MODEL || 'mistral',
+  ollamaModel: process.env.OLLAMA_MODEL || 'qwen2.5-coder:7b-instruct-q4_K_M', // qwen2.5-coder with function calling support
 
   // MCP Server Configuration
   mcpServerUrl: process.env.MCP_SERVER_URL || 'http://localhost:3001',
